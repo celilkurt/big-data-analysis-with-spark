@@ -2,10 +2,9 @@ package stackoverflow
 
 import org.apache.spark.SparkConf
 import org.apache.spark.SparkContext
-import org.apache.spark.SparkContext._
 import org.apache.spark.rdd.RDD
+
 import annotation.tailrec
-import scala.reflect.ClassTag
 
 /** A raw stackoverflow posting, either a question or an answer */
 case class Posting(postingType: Int, id: Int, acceptedAnswer: Option[Int], parentId: Option[QID], score: Int, tags: Option[String]) extends Serializable
@@ -25,7 +24,7 @@ object StackOverflow extends StackOverflow {
     val grouped = groupedPostings(raw)
     val scored  = scoredPostings(grouped)
     val vectors = vectorPostings(scored)
-//    assert(vectors.count() == 2121822, "Incorrect number of vectors: " + vectors.count())
+    assert(vectors.count() == 2121822, "Incorrect number of vectors: " + vectors.count())
 
     val means   = kmeans(sampleVectors(vectors), vectors, debug = true)
     val results = clusterResults(means, vectors)
@@ -77,7 +76,22 @@ class StackOverflow extends StackOverflowInterface with Serializable {
 
   /** Group the questions and answers together */
   def groupedPostings(postings: RDD[Posting]): RDD[(QID, Iterable[(Question, Answer)])] = {
-    ???
+
+
+    val questions: RDD[(QID, Question)] =
+      postings
+        .filter(_.postingType == 1)
+        .map(post => (post.id, post))
+
+    val answers: RDD[(QID, Answer)] =
+      postings
+        .filter(_.postingType == 2)
+        .map(post => (post.parentId.get, post))
+
+    questions
+      .join(answers)
+      .groupByKey
+
   }
 
 
@@ -94,9 +108,14 @@ class StackOverflow extends StackOverflowInterface with Serializable {
                   i += 1
           }
       highScore
+
     }
 
-    ???
+    grouped
+      .map(group => {
+        val list = group._2.toArray
+        (list.head._1, answerHighScore(list.map(_._2)))
+      })
   }
 
 
@@ -116,7 +135,11 @@ class StackOverflow extends StackOverflowInterface with Serializable {
       }
     }
 
-    ???
+    scored
+      .filter(_._1.tags.isDefined)
+      .map(group => (firstLangInTag(group._1.tags, langs).get*langSpread, group._2))
+      .persist
+
   }
 
 
@@ -171,7 +194,19 @@ class StackOverflow extends StackOverflowInterface with Serializable {
 
   /** Main kmeans computation */
   @tailrec final def kmeans(means: Array[(Int, Int)], vectors: RDD[(Int, Int)], iter: Int = 1, debug: Boolean = false): Array[(Int, Int)] = {
+
     val newMeans = means.clone() // you need to compute newMeans
+
+    val newClusters =
+      vectors
+        .map(elem => (findClosest(elem, means), elem))
+        .groupByKey
+        .map(x => (x._1, averageVectors(x._2)))
+        .collect
+
+    for(k <- newClusters){
+      newMeans.update(k._1, k._2)
+    }
 
     // TODO: Fill in the newMeans array
     val distance = euclideanDistance(means, newMeans)
@@ -208,7 +243,7 @@ class StackOverflow extends StackOverflowInterface with Serializable {
   //
 
   /** Decide whether the kmeans clustering converged */
-  def converged(distance: Double) =
+  def converged(distance: Double): Boolean =
     distance < kmeansEta
 
 
@@ -274,10 +309,13 @@ class StackOverflow extends StackOverflowInterface with Serializable {
     val closestGrouped = closest.groupByKey()
 
     val median = closestGrouped.mapValues { vs =>
-      val langLabel: String   = ??? // most common language in the cluster
-      val langPercent: Double = ??? // percent of the questions in the most common language
-      val clusterSize: Int    = ???
-      val medianScore: Int    = ???
+      val langIndAndOcc = vs.groupBy(_._1).mapValues(group => group.size).maxBy(_._2)
+
+      val langLabel: String   = langs(langIndAndOcc._1/langSpread)// most common language in the cluster
+      val clusterSize: Int    = vs.size
+      val langPercent: Double = langIndAndOcc._2 * 100d / clusterSize // percent of the questions in the most common language
+      val scores = vs.map(_._2)
+      val medianScore: Int    = if(clusterSize % 2 == 0) (scores.max + scores.min) / 2 else scores.toArray.sorted(Ordering[HighScore])(clusterSize/2)
 
       (langLabel, langPercent, clusterSize, medianScore)
     }
